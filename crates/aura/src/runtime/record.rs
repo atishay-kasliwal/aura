@@ -2,23 +2,40 @@
 //! here is serialized; what crosses to a caller is a snapshot of
 //! [`RunFacts`] or an [`AgentState`](super::AgentState).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use aura_events::run::RunCancelReason;
+use aura_events::run::{Liveness, RunCancelReason};
 use aura_events::{RunId, SessionId, TokenCount, TokenUsage};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::journal::SessionJournal;
+use crate::run_context::{Attendance, RunContext};
 use crate::session_store::{RunFacts, RunStatus};
 use crate::streaming_request_hook::UsageState;
+
+use super::observe::ObserverSet;
 
 /// One session the runtime holds.
 pub(crate) struct SessionRecord {
     pub(super) id: SessionId,
     pub(super) journal: Arc<SessionJournal>,
     state: Mutex<SessionState>,
+    /// Signals that a reopened record has replaced this one.
+    pub(super) superseded: CancellationToken,
+    /// The session's observer attaches and detaches still being written.
+    observer_writes: Arc<ObserverWrites>,
+}
+
+/// Observer attaches and detaches under way on a session, not yet on its
+/// stream.
+#[derive(Default)]
+struct ObserverWrites {
+    pending: AtomicUsize,
+    /// Signals that one of them is no longer being written.
+    ended: Notify,
 }
 
 /// A session's mutable state, behind one lock.
@@ -29,14 +46,8 @@ pub(crate) struct SessionState {
     pub(super) last_run: Option<(RunId, RunStatus)>,
     /// Ended runs of the session still within the retention window.
     pub(super) retained: usize,
-}
-
-impl SessionState {
-    /// Whether the session holds nothing: no live run and no ended run still
-    /// retained.
-    pub(super) fn is_idle(&self) -> bool {
-        self.live.is_none() && self.retained == 0
-    }
+    /// The observers attached to the session.
+    pub(super) observers: ObserverSet,
 }
 
 impl SessionRecord {
@@ -48,12 +59,74 @@ impl SessionRecord {
                 live: None,
                 last_run: None,
                 retained: 0,
+                observers: ObserverSet::default(),
             }),
+            superseded: CancellationToken::new(),
+            observer_writes: Arc::default(),
+        }
+    }
+
+    /// A record for `fenced`'s session over a new journal. It takes over the
+    /// fenced record's last run and observers, and shares its count of
+    /// observer writes under way, since those writes now go to the new
+    /// journal and the session must not be let go before they finish.
+    pub(super) fn reopening(fenced: &Self, journal: SessionJournal) -> Self {
+        let mut from = fenced.lock();
+        Self {
+            id: fenced.id.clone(),
+            journal: Arc::new(journal),
+            state: Mutex::new(SessionState {
+                live: None,
+                last_run: from.last_run,
+                retained: 0,
+                observers: std::mem::take(&mut from.observers),
+            }),
+            superseded: CancellationToken::new(),
+            observer_writes: Arc::clone(&fenced.observer_writes),
         }
     }
 
     pub(super) fn lock(&self) -> MutexGuard<'_, SessionState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the session holds nothing: no live run, no retained run, no
+    /// observers, and no attach or detach still being written.
+    pub(super) fn is_idle(&self) -> bool {
+        let state = self.lock();
+        state.live.is_none()
+            && state.retained == 0
+            && state.observers.is_empty()
+            && self.observer_writes.pending.load(Ordering::SeqCst) == 0
+    }
+
+    /// Counts one more attach or detach as being written. Called with the
+    /// session's state locked, alongside the change it records.
+    pub(super) fn begin_observer_write(&self) {
+        self.observer_writes.pending.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Ends one attach or detach counted by
+    /// [`begin_observer_write`](Self::begin_observer_write), written or not.
+    pub(super) fn finish_observer_write(&self) {
+        let _ =
+            self.observer_writes
+                .pending
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        self.observer_writes.ended.notify_waiters();
+    }
+
+    /// Waits until no observer attach or detach is being written.
+    pub(super) async fn observer_writes_done(&self) {
+        loop {
+            let notified = self.observer_writes.ended.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.observer_writes.pending.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -67,6 +140,8 @@ pub(crate) struct RunRecord {
     usage: OnceLock<UsageState>,
     facts: watch::Sender<RunFacts>,
     task: Mutex<TaskSlot>,
+    /// The run's context.
+    context: Mutex<Option<Arc<RunContext>>>,
 }
 
 /// Whether and why a run was stopped.
@@ -107,7 +182,39 @@ impl RunRecord {
             usage: OnceLock::new(),
             facts: watch::Sender::new(facts),
             task: Mutex::new(TaskSlot::default()),
+            context: Mutex::new(None),
         }
+    }
+
+    fn context_slot(&self) -> MutexGuard<'_, Option<Arc<RunContext>>> {
+        self.context.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stores the run's context, writing `attendance` onto it first.
+    pub(super) fn bind_context(&self, context: Arc<RunContext>, attendance: Attendance) {
+        context.attend(attendance);
+        *self.context_slot() = Some(context);
+    }
+
+    pub(super) fn unbind_context(&self) {
+        *self.context_slot() = None;
+    }
+
+    /// The run's context, while the run streams.
+    #[cfg(test)]
+    pub(super) fn context(&self) -> Option<Arc<RunContext>> {
+        self.context_slot().clone()
+    }
+
+    /// Writes `attendance` onto the run's context, when one is bound.
+    pub(super) fn mirror(&self, attendance: Attendance) {
+        if let Some(context) = &*self.context_slot() {
+            context.attend(attendance);
+        }
+    }
+
+    pub(super) fn liveness(&self) -> Liveness {
+        self.facts.borrow().liveness
     }
 
     /// The run's facts. A live run's usage is read from its counters now,
@@ -157,6 +264,11 @@ impl RunRecord {
         stops.reason.get_or_insert((reason, message));
         self.cancel.cancel();
         true
+    }
+
+    /// Whether a stop would still be taken.
+    pub(super) fn stoppable(&self) -> bool {
+        !self.stops().closed
     }
 
     /// Refuses every later stop.
